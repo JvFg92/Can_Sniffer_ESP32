@@ -7,152 +7,126 @@
 #include <stdio.h>
 #include "string.h"
 #include "stdbool.h"
-#include "driver/twai.h"
 
+// Define as configurações para as duas UARTs
 #define BUF_SIZE (1024)
 #define BAUD_RATE (115200)
-#define UART0 UART_NUM_0
-#define PC_TXD_PIN (GPIO_NUM_1)
-#define PC_RXD_PIN (GPIO_NUM_3)
 
-static const char *TAG = "TWAI_EXAMPLE_PIO";
+// Configuração UART0 (geralmente usada para comunicação com o PC via USB)
+#define UART0_PORT UART_NUM_0
+#define UART0_TXD_PIN (GPIO_NUM_1)
+#define UART0_RXD_PIN (GPIO_NUM_3)
 
-static QueueHandle_t uart_queue_0;
+// Configuração UART2 (conectada a um módulo externo, por exemplo)
+#define UART2_PORT UART_NUM_2
+#define UART2_TXD_PIN (GPIO_NUM_17) // PINO TX DO ESP32 PARA A UART2
+#define UART2_RXD_PIN (GPIO_NUM_16) // PINO RX DO ESP32 PARA A UART2
 
-void uart_init_config(void) {
+static const char *TAG = "UART_BRIDGE";
 
+// Filas para enviar dados de uma UART para a outra
+static QueueHandle_t uart0_tx_queue;
+static QueueHandle_t uart2_tx_queue;
+
+// Estrutura para passar parâmetros para as tarefas UART
+typedef struct {
+    uart_port_t rx_port;
+    QueueHandle_t tx_queue;
+} uart_task_params_t;
+
+// Função de inicialização genérica para qualquer UART
+void uart_init_config(uart_port_t uart_num, int txd_pin, int rxd_pin) {
     const uart_config_t uart_config = {
-        .baud_rate = BAUD_RATE,             // Taxa de baud
-        .data_bits = UART_DATA_8_BITS,      // 8 bits de dados
-        .parity = UART_PARITY_DISABLE,      // Sem paridade
-        .stop_bits = UART_STOP_BITS_1,      // 1 bit de parada
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, // Sem controle de fluxo de hardware
-        .source_clk = UART_SCLK_APB,        // Usa o clock APB para a UART
+        .baud_rate = BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
     };
 
-    ESP_ERROR_CHECK(uart_param_config(UART0, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART0, PC_TXD_PIN, PC_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(UART0, BUF_SIZE * 2, 0, 0, NULL, 0));
-    uart_queue_0 = xQueueCreate(1, sizeof(char) * BUF_SIZE);
+    ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(uart_num, txd_pin, rxd_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(uart_num, BUF_SIZE * 2, 0, 0, NULL, 0));
 
-    printf("UART%d inicializada nos pinos TXD (GPIO%d), RXD (GPIO%d) a %d baud.\n",
-           UART0, PC_TXD_PIN, PC_RXD_PIN, BAUD_RATE);
+    ESP_LOGI(TAG, "UART%d inicializada nos pinos TXD (GPIO%d), RXD (GPIO%d) a %d baud.",
+             uart_num, txd_pin, rxd_pin, BAUD_RATE);
 }
 
-void uart_send_task(void *pvParameters) {
-    char data[BUF_SIZE];
-    while (1) {
-        if (xQueueReceive(uart_queue_0, &data, portMAX_DELAY) == pdPASS) {
-            uart_write_bytes(UART0, data, strlen(data));
-        }
-    }
-}
-
-void uart_receive_task(void *pvParameters) {
-    static const char *PC_RX_TASK_TAG = "PC_RX_TASK";
-    esp_log_level_set(PC_RX_TASK_TAG, ESP_LOG_INFO);
+// Tarefa genérica para RECEBER dados de uma UART e ENVIAR para a outra
+void uart_receive_and_forward_task(void *pvParameters) {
+    uart_task_params_t *params = (uart_task_params_t *)pvParameters;
+    uart_port_t rx_port = params->rx_port;
+    QueueHandle_t tx_queue = params->tx_queue;
 
     char* data = (char*) malloc(BUF_SIZE + 1);
     if (data == NULL) {
-        ESP_LOGE(PC_RX_TASK_TAG, "Falha ao alocar memória para o buffer RX!");
+        ESP_LOGE(TAG, "Falha ao alocar memória para o buffer RX da UART%d!", rx_port);
         vTaskDelete(NULL);
     }
 
     while (1) {
         memset(data, 0, BUF_SIZE + 1);
-        int rxBytes = uart_read_bytes(UART0, data, BUF_SIZE, 5 / portTICK_PERIOD_MS);
-
+        int rxBytes = uart_read_bytes(rx_port, data, BUF_SIZE, 50 / portTICK_PERIOD_MS);
+        
         if (rxBytes > 0) {
-           data[rxBytes] = '\0';
-            //ESP_LOGI(PC_RX_TASK_TAG, "Recebido: '%s'", data); // Loga a mensagem recebida
-
-            if (xQueueSend(uart_queue_0, data, portMAX_DELAY) != pdPASS) {
-                    ESP_LOGE(PC_RX_TASK_TAG, "Falha ao enviar dados para a fila");
-            }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(10));
+           data[rxBytes] = '\0'; // Adiciona terminador de string
+           ESP_LOGI(TAG, "UART%d -> Recebido: '%s'", rx_port, data);
+           
+           // Envia os dados recebidos para a fila de transmissão da OUTRA UART
+           if (xQueueSend(tx_queue, data, portMAX_DELAY) != pdPASS) {
+                ESP_LOGE(TAG, "Falha ao enviar dados da UART%d para a fila de transmissão.", rx_port);
+           }
         }
     }
 }
 
-// --- NOVA TAREFA PARA RECEBER MENSAGENS CAN ---
-void twai_receive_task(void *pvParameters) {
-    twai_message_t message;
+// Tarefa genérica para ENVIAR dados de uma fila para uma UART
+void uart_send_task(void *pvParameters) {
+    uart_task_params_t *params = (uart_task_params_t *)pvParameters;
+    uart_port_t tx_port = params->rx_port;
+    QueueHandle_t tx_queue = params->tx_queue;
+    
+    char data[BUF_SIZE];
     while (1) {
-        // Aguarda a recepção de uma mensagem TWAI na fila de recepção
-        esp_err_t err = twai_receive(&message, portMAX_DELAY); // Espera indefinidamente por uma mensagem
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Mensagem CAN Recebida:");
-            ESP_LOGI(TAG, "  ID: 0x%lX", message.identifier);
-            ESP_LOGI(TAG, "  DLC: %d", message.data_length_code);
-            // Verifica se a mensagem é remota (RTR)
-            if (message.flags & TWAI_MSG_FLAG_RTR) {
-                ESP_LOGI(TAG, "  Tipo: Mensagem de Requisição Remota (RTR)");
-            } else {
-                ESP_LOGI(TAG, "  Tipo: Mensagem de Dados");
-                printf("  Dados: ");
-                for (int i = 0; i < message.data_length_code; i++) {
-                    printf("0x%02X ", message.data[i]);
-                }
-                printf("\n");
-            }
-        } else if (err == ESP_ERR_TIMEOUT) {
-            // Este caso não deveria ocorrer com portMAX_DELAY, mas é bom ter para depuração.
-            ESP_LOGW(TAG, "Tempo limite expirado ao receber mensagem TWAI.");
-        } else {
-            ESP_LOGE(TAG, "Erro ao receber mensagem TWAI: %s", esp_err_to_name(err));
+        if (xQueueReceive(tx_queue, &data, portMAX_DELAY) == pdPASS) {
+            ESP_LOGI(TAG, "UART%d -> Enviando: '%s'", tx_port, data);
+            uart_write_bytes(tx_port, data, strlen(data));
         }
-        vTaskDelay(pdMS_TO_TICKS(10)); // Pequeno atraso para evitar consumo excessivo de CPU
     }
 }
 
 void app_main(void) {
+    // Inicializa as duas UARTs
+    uart_init_config(UART0_PORT, UART0_TXD_PIN, UART0_RXD_PIN);
+    uart_init_config(UART2_PORT, UART2_TXD_PIN, UART2_RXD_PIN);
 
-    uart_init_config();
+    // Cria as filas de comunicação entre as tarefas
+    uart0_tx_queue = xQueueCreate(10, sizeof(char) * BUF_SIZE);
+    uart2_tx_queue = xQueueCreate(10, sizeof(char) * BUF_SIZE);
 
-    xTaskCreate(uart_send_task, "uart_send_task", BUF_SIZE * 2, NULL, configMAX_PRIORITIES - 2, NULL);
-    xTaskCreate(uart_receive_task, "uart_receive_task", BUF_SIZE * 2, NULL, configMAX_PRIORITIES - 1, NULL);
+    // Declaração das variáveis
+    uart_task_params_t uart0_rx_params;
+    uart_task_params_t uart0_tx_params;
+    uart_task_params_t uart2_rx_params;
+    uart_task_params_t uart2_tx_params;
 
+    // Inicialização das variáveis em tempo de execução
+    uart0_rx_params.rx_port = UART0_PORT;
+    uart0_rx_params.tx_queue = uart2_tx_queue; // Recebe de UART0 e envia para a fila de transmissão de UART2
 
-    ESP_LOGI(TAG, "Iniciando o exemplo TWAI com PlatformIO");
+    uart0_tx_params.rx_port = UART0_PORT;
+    uart0_tx_params.tx_queue = uart0_tx_queue; // Envia de sua própria fila de transmissão para UART0
 
-    // Configuração geral: Pinos RX e TX para CAN, modo normal
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_25, GPIO_NUM_27, TWAI_MODE_NORMAL);
-    // Configuração de tempo: 500 Kbits/s
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
-    // Configuração de filtro: Aceita todas as mensagens
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    uart2_rx_params.rx_port = UART2_PORT;
+    uart2_rx_params.tx_queue = uart0_tx_queue; // Recebe de UART2 e envia para a fila de transmissão de UART0
 
-    if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
-        ESP_LOGI(TAG, "Driver TWAI instalado.");
-    } else {
-        ESP_LOGE(TAG, "Falha ao instalar o driver TWAI.");
-        return;
-    }
+    uart2_tx_params.rx_port = UART2_PORT;
+    uart2_tx_params.tx_queue = uart2_tx_queue; // Envia de sua própria fila de transmissão para UART2
 
-    if (twai_start() == ESP_OK) {
-        ESP_LOGI(TAG, "Driver TWAI iniciado.");
-    } else {
-        ESP_LOGE(TAG, "Falha ao iniciar o driver TWAI.");
-        twai_driver_uninstall();
-        return;
-    }
-
-    // --- Criação da tarefa de recepção TWAI ---
-    xTaskCreate(twai_receive_task, "twai_receive_task", 4096, NULL, configMAX_PRIORITIES - 3, NULL);
-
-    // Mensagem de teste para ser enviada uma vez (como já estava no seu código)
-    twai_message_t message;
-    message.identifier = 0x123;
-    message.flags = TWAI_MSG_FLAG_NONE; // Define como mensagem de dados, não RTR
-    message.data_length_code = 8;
-    for (int i = 0; i < 8; i++) {
-        message.data[i] = i;
-    }
-
-    if (twai_transmit(&message, pdMS_TO_TICKS(100)) == ESP_OK) {
-        ESP_LOGI(TAG, "Mensagem TWAI de teste enviada com sucesso.");
-    } else {
-        ESP_LOGE(TAG, "Falha ao enviar mensagem TWAI de teste.");
-    }
+    // Cria as tarefas
+    xTaskCreate(uart_receive_and_forward_task, "uart0_rx_task", 4096, (void*)&uart0_rx_params, configMAX_PRIORITIES - 2, NULL);
+    xTaskCreate(uart_send_task, "uart0_tx_task", 4096, (void*)&uart0_tx_params, configMAX_PRIORITIES - 3, NULL);
+    xTaskCreate(uart_receive_and_forward_task, "uart2_rx_task", 4096, (void*)&uart2_rx_params, configMAX_PRIORITIES - 2, NULL);
+    xTaskCreate(uart_send_task, "uart2_tx_task", 4096, (void*)&uart2_tx_params, configMAX_PRIORITIES - 3, NULL);
 }
