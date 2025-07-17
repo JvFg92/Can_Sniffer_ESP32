@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include "string.h"
 #include "stdbool.h"
-#include "driver/twai.h" 
+#include "driver/twai.h"
 
 #define BUF_SIZE (1024)
 #define BAUD_RATE (115200)
@@ -17,7 +17,7 @@
 
 static const char *TAG = "TWAI_EXAMPLE_PIO";
 
-static QueueHandle_t uart_queue_0; 
+static QueueHandle_t uart_queue_0;
 
 void uart_init_config(void) {
 
@@ -32,7 +32,7 @@ void uart_init_config(void) {
 
     ESP_ERROR_CHECK(uart_param_config(UART0, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART0, PC_TXD_PIN, PC_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(UART0, BUF_SIZE * 2, 0, 0, NULL, 0)); 
+    ESP_ERROR_CHECK(uart_driver_install(UART0, BUF_SIZE * 2, 0, 0, NULL, 0));
     uart_queue_0 = xQueueCreate(1, sizeof(char) * BUF_SIZE);
 
     printf("UART%d inicializada nos pinos TXD (GPIO%d), RXD (GPIO%d) a %d baud.\n",
@@ -40,7 +40,7 @@ void uart_init_config(void) {
 }
 
 void uart_send_task(void *pvParameters) {
-    char data[BUF_SIZE]; 
+    char data[BUF_SIZE];
     while (1) {
         if (xQueueReceive(uart_queue_0, &data, portMAX_DELAY) == pdPASS) {
             uart_write_bytes(UART0, data, strlen(data));
@@ -50,12 +50,12 @@ void uart_send_task(void *pvParameters) {
 
 void uart_receive_task(void *pvParameters) {
     static const char *PC_RX_TASK_TAG = "PC_RX_TASK";
-    esp_log_level_set(PC_RX_TASK_TAG, ESP_LOG_INFO); 
+    esp_log_level_set(PC_RX_TASK_TAG, ESP_LOG_INFO);
 
-    char* data = (char*) malloc(BUF_SIZE + 1); 
+    char* data = (char*) malloc(BUF_SIZE + 1);
     if (data == NULL) {
         ESP_LOGE(PC_RX_TASK_TAG, "Falha ao alocar memória para o buffer RX!");
-        vTaskDelete(NULL); 
+        vTaskDelete(NULL);
     }
 
     while (1) {
@@ -75,6 +75,37 @@ void uart_receive_task(void *pvParameters) {
     }
 }
 
+// --- NOVA TAREFA PARA RECEBER MENSAGENS CAN ---
+void twai_receive_task(void *pvParameters) {
+    twai_message_t message;
+    while (1) {
+        // Aguarda a recepção de uma mensagem TWAI na fila de recepção
+        esp_err_t err = twai_receive(&message, portMAX_DELAY); // Espera indefinidamente por uma mensagem
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Mensagem CAN Recebida:");
+            ESP_LOGI(TAG, "  ID: 0x%lX", message.identifier);
+            ESP_LOGI(TAG, "  DLC: %d", message.data_length_code);
+            // Verifica se a mensagem é remota (RTR)
+            if (message.flags & TWAI_MSG_FLAG_RTR) {
+                ESP_LOGI(TAG, "  Tipo: Mensagem de Requisição Remota (RTR)");
+            } else {
+                ESP_LOGI(TAG, "  Tipo: Mensagem de Dados");
+                printf("  Dados: ");
+                for (int i = 0; i < message.data_length_code; i++) {
+                    printf("0x%02X ", message.data[i]);
+                }
+                printf("\n");
+            }
+        } else if (err == ESP_ERR_TIMEOUT) {
+            // Este caso não deveria ocorrer com portMAX_DELAY, mas é bom ter para depuração.
+            ESP_LOGW(TAG, "Tempo limite expirado ao receber mensagem TWAI.");
+        } else {
+            ESP_LOGE(TAG, "Erro ao receber mensagem TWAI: %s", esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(10)); // Pequeno atraso para evitar consumo excessivo de CPU
+    }
+}
+
 void app_main(void) {
 
     uart_init_config();
@@ -85,8 +116,11 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "Iniciando o exemplo TWAI com PlatformIO");
 
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_21, GPIO_NUM_22, TWAI_MODE_NORMAL);
+    // Configuração geral: Pinos RX e TX para CAN, modo normal
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_25, GPIO_NUM_27, TWAI_MODE_NORMAL);
+    // Configuração de tempo: 500 Kbits/s
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    // Configuração de filtro: Aceita todas as mensagens
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
@@ -104,17 +138,21 @@ void app_main(void) {
         return;
     }
 
+    // --- Criação da tarefa de recepção TWAI ---
+    xTaskCreate(twai_receive_task, "twai_receive_task", 4096, NULL, configMAX_PRIORITIES - 3, NULL);
+
+    // Mensagem de teste para ser enviada uma vez (como já estava no seu código)
     twai_message_t message;
     message.identifier = 0x123;
-    message.flags = TWAI_MSG_FLAG_NONE;
+    message.flags = TWAI_MSG_FLAG_NONE; // Define como mensagem de dados, não RTR
     message.data_length_code = 8;
     for (int i = 0; i < 8; i++) {
         message.data[i] = i;
     }
 
     if (twai_transmit(&message, pdMS_TO_TICKS(100)) == ESP_OK) {
-        ESP_LOGI(TAG, "Mensagem TWAI enviada com sucesso.");
+        ESP_LOGI(TAG, "Mensagem TWAI de teste enviada com sucesso.");
     } else {
-        ESP_LOGE(TAG, "Falha ao enviar mensagem TWAI.");
+        ESP_LOGE(TAG, "Falha ao enviar mensagem TWAI de teste.");
     }
 }
